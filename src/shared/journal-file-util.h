@@ -7,6 +7,7 @@
 int journal_file_set_offline(JournalFile *f, bool wait);
 bool journal_file_is_offlining(JournalFile *f);
 JournalFile* journal_file_offline_close(JournalFile *f);
+JournalFile* journal_file_deferred_close(JournalFile *f);
 DEFINE_TRIVIAL_CLEANUP_FUNC(JournalFile*, journal_file_offline_close);
 
 int journal_file_open_reliably(
@@ -28,3 +29,4 @@ int journal_file_rotate(
                 Set *deferred_closes);
 
 extern const struct hash_ops journal_file_hash_ops_offline_close;
+extern const struct hash_ops journal_file_hash_ops_deferred_close;

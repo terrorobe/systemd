@@ -377,8 +377,10 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
                 assert_se(sigdelset(&ss, SIGBUS) >= 0);
 
                 r = pthread_sigmask(SIG_BLOCK, &ss, &saved_ss);
-                if (r > 0)
+                if (r > 0) {
+                        f->offline_state = OFFLINE_JOINED;
                         return -r;
+                }
 
                 r = pthread_create(&f->offline_thread, NULL, journal_file_set_offline_thread, f);
 
@@ -424,22 +426,51 @@ JournalFile* journal_file_offline_close(JournalFile *f) {
         return journal_file_close(f);
 }
 
+JournalFile* journal_file_deferred_close(JournalFile *f) {
+        int r;
+
+        if (!f)
+                return NULL;
+
+        assert(!f->post_change_timer);
+
+        r = journal_file_set_offline_thread_join(f);
+        if (r < 0)
+                log_debug_errno(r, "Failed to join journal offlining thread for '%s', ignoring: %m", f->path);
+
+        if (f->header->state != (f->archive ? STATE_ARCHIVED : STATE_OFFLINE)) {
+                r = journal_file_set_offline(f, /* wait= */ true);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to set journal file '%s' offline, ignoring: %m", f->path);
+        }
+
+        return journal_file_close(f);
+}
+
 JournalFile* journal_file_initiate_close(JournalFile *f, Set *deferred_closes) {
         int r;
 
         assert(f);
+
+        /* Once asynchronous offlining starts, the file must remain immutable. Finish the notification update
+         * and detach its timer before handing the file to the worker. */
+        if (sd_event_source_get_enabled(f->post_change_timer, NULL) > 0)
+                journal_file_post_change(f);
+        f->post_change_timer = sd_event_source_disable_unref(f->post_change_timer);
 
         if (deferred_closes) {
                 r = set_put(deferred_closes, f);
                 if (r < 0)
                         log_debug_errno(r, "Failed to add file to deferred close set, closing immediately.");
                 else {
-                        (void) journal_file_set_offline(f, false);
+                        r = journal_file_set_offline(f, /* wait= */ false);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to start asynchronous journal offlining, deferring synchronous fallback: %m");
                         return NULL;
                 }
         }
 
-        return journal_file_offline_close(f);
+        return journal_file_deferred_close(f);
 }
 
 int journal_file_rotate(
@@ -553,3 +584,8 @@ DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
                 journal_file_hash_ops_offline_close,
                 void, trivial_hash_func, trivial_compare_func,
                 JournalFile, journal_file_offline_close);
+
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                journal_file_hash_ops_deferred_close,
+                void, trivial_hash_func, trivial_compare_func,
+                JournalFile, journal_file_deferred_close);

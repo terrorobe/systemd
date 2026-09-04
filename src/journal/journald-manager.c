@@ -585,7 +585,7 @@ static void manager_process_deferred_closes(Manager *m) {
                         continue;
 
                 (void) set_remove(m->deferred_closes, f);
-                (void) journal_file_offline_close(f);
+                (void) journal_file_deferred_close(f);
         }
 }
 
@@ -604,7 +604,7 @@ static void manager_vacuum_deferred_closes(Manager *m) {
                 JournalFile *f;
 
                 assert_se(f = set_steal_first(m->deferred_closes));
-                journal_file_offline_close(f);
+                journal_file_deferred_close(f);
         }
 }
 
@@ -2366,7 +2366,7 @@ int manager_init(Manager *m) {
         if (!m->mmap)
                 return log_oom();
 
-        m->deferred_closes = set_new(&journal_file_hash_ops_offline_close);
+        m->deferred_closes = set_new(&journal_file_hash_ops_deferred_close);
         if (!m->deferred_closes)
                 return log_oom();
 
