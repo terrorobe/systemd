@@ -79,7 +79,9 @@
 /* The period to insert between posting changes for coalescing */
 #define POST_CHANGE_TIMER_INTERVAL_USEC (250*USEC_PER_MSEC)
 
-#define DEFERRED_CLOSES_MAX (4096)
+/* Ordinary rotations historically waited for the previous asynchronous close. Keep one additional
+ * generation in flight, but apply backpressure before deferred files and threads can accumulate. */
+#define DEFERRED_CLOSES_MAX 2U
 
 #define IDLE_TIMEOUT_USEC (30*USEC_PER_SEC)
 
