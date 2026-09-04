@@ -495,8 +495,6 @@ int journal_file_rotate(
         if (r < 0)
                 return r;
 
-        set_clear(deferred_closes);
-
         r = journal_file_open(
                         /* fd= */ -EBADF,
                         path,

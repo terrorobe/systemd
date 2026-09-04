@@ -11,6 +11,7 @@
 #include "journal-vacuum.h"
 #include "log.h"
 #include "rm-rf.h"
+#include "set.h"
 #include "stdio-util.h"
 #include "tests.h"
 #include "time-util.h"
@@ -28,6 +29,7 @@ static void mkdtemp_chdir_chattr(char *path) {
 
 static void test_non_empty_one(void) {
         _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
+        _cleanup_set_free_ Set *deferred_closes = NULL;
         dual_timestamp ts;
         JournalFile *f;
         struct iovec iovec;
@@ -38,6 +40,7 @@ static void test_non_empty_one(void) {
         char t[] = "/var/tmp/journal-XXXXXX";
 
         ASSERT_NOT_NULL(m = mmap_cache_new());
+        ASSERT_NOT_NULL(deferred_closes = set_new(&journal_file_hash_ops_deferred_close));
 
         mkdtemp_chdir_chattr(t);
 
@@ -101,10 +104,13 @@ static void test_non_empty_one(void) {
 
         ASSERT_OK_ZERO(journal_file_move_to_entry_by_seqnum(f, 10, DIRECTION_DOWN, &o, NULL));
 
-        journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, NULL);
-        journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, NULL);
+        ASSERT_OK(journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, deferred_closes));
+        ASSERT_EQ(set_size(deferred_closes), 1u);
+        ASSERT_OK(journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, deferred_closes));
+        ASSERT_EQ(set_size(deferred_closes), 2u);
 
         (void) journal_file_offline_close(f);
+        set_clear(deferred_closes);
 
         log_info("Done...");
 

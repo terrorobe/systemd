@@ -87,6 +87,7 @@
 
 static int manager_schedule_sync(Manager *m, int priority);
 static int manager_refresh_idle_timer(Manager *m);
+static void manager_vacuum_deferred_closes(Manager *m);
 
 static int manager_determine_path_usage(
                 Manager *m,
@@ -561,6 +562,8 @@ static int manager_do_rotate(
                 return -EINVAL;
 
         log_debug("Rotating journal file %s.", (*f)->path);
+
+        manager_vacuum_deferred_closes(m);
 
         r = journal_file_rotate(f, m->mmap, manager_get_file_flags(m, seal), m->config.compress.threshold_bytes, m->deferred_closes);
         if (r < 0) {
