@@ -5,16 +5,20 @@
 
 #include "argv-util.h"
 #include "chattr-util.h"
+#include "fd-util.h"
 #include "iovec-util.h"
 #include "journal-authenticate.h"
 #include "journal-file-util.h"
 #include "journal-vacuum.h"
 #include "log.h"
+#include "mkdir.h"
+#include "path-util.h"
 #include "rm-rf.h"
 #include "set.h"
 #include "stdio-util.h"
 #include "tests.h"
 #include "time-util.h"
+#include "tmpfile-util.h"
 
 static bool arg_keep = false;
 
@@ -585,6 +589,41 @@ TEST(recover_truncated_hash_chain) {
                 test_recover_truncated_hash_chain_one(/* field= */ true, /* zeroed_tail= */ false);
                 test_recover_truncated_hash_chain_one(/* field= */ true, /* zeroed_tail= */ true);
         }
+}
+
+TEST(deferred_close_synchronous_fallback) {
+        _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *directory = NULL;
+        _cleanup_free_ char *path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        JournalFile *f = NULL;
+        uint8_t state;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &directory));
+        ASSERT_NOT_NULL(path = path_join(directory, "fallback.journal"));
+        ASSERT_NOT_NULL(m = mmap_cache_new());
+        ASSERT_OK_ZERO(journal_file_open(
+                                -EBADF,
+                                path,
+                                O_RDWR|O_CREAT,
+                                /* file_flags= */ 0,
+                                0600,
+                                UINT64_MAX,
+                                /* metrics= */ NULL,
+                                m,
+                                /* template= */ NULL,
+                                &f));
+
+        ASSERT_FALSE(f->archive);
+        ASSERT_TRUE(__atomic_load_n(&f->offline_state, __ATOMIC_SEQ_CST) == OFFLINE_JOINED);
+        ASSERT_NULL(f->post_change_timer);
+        f->archive = true;
+
+        ASSERT_NULL(journal_file_deferred_close(f));
+
+        ASSERT_OK_ERRNO(fd = open(path, O_RDONLY|O_CLOEXEC));
+        assert_se(pread(fd, &state, sizeof(state), offsetof(Header, state)) == (ssize_t) sizeof(state));
+        ASSERT_EQ(state, STATE_ARCHIVED);
 }
 
 static int intro(void) {

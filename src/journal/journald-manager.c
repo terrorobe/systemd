@@ -89,7 +89,6 @@
 
 static int manager_schedule_sync(Manager *m, int priority);
 static int manager_refresh_idle_timer(Manager *m);
-static void manager_vacuum_deferred_closes(Manager *m);
 
 static int manager_determine_path_usage(
                 Manager *m,
@@ -594,7 +593,7 @@ static void manager_process_deferred_closes(Manager *m) {
         }
 }
 
-static void manager_vacuum_deferred_closes(Manager *m) {
+void manager_vacuum_deferred_closes(Manager *m) {
         assert(m);
 
         /* Make some room in the deferred closes list, so that it doesn't grow without bounds */
@@ -775,6 +774,9 @@ static void manager_rotate_journal(Manager *m, JournalFile *f, uid_t uid) {
 static void manager_sync(Manager *m, bool wait) {
         JournalFile *f;
         int r;
+
+        if (wait)
+                set_clear(m->deferred_closes);
 
         if (m->system_journal) {
                 r = journal_file_set_offline(m->system_journal, wait);
