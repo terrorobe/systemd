@@ -192,7 +192,7 @@ int journal_file_set_offline_thread_join(JournalFile *f) {
 
         assert(f);
 
-        if (f->offline_state == OFFLINE_JOINED)
+        if (__atomic_load_n(&f->offline_state, __ATOMIC_SEQ_CST) == OFFLINE_JOINED)
                 return 0;
 
         log_debug("Joining journal offlining thread for %s.", f->path);
@@ -203,7 +203,7 @@ int journal_file_set_offline_thread_join(JournalFile *f) {
 
         log_debug("Journal offlining thread for %s joined.", f->path);
 
-        f->offline_state = OFFLINE_JOINED;
+        __atomic_store_n(&f->offline_state, OFFLINE_JOINED, __ATOMIC_SEQ_CST);
 
         if (mmap_cache_fd_got_sigbus(f->cache_fd))
                 return -EIO;
@@ -223,7 +223,7 @@ static int journal_file_set_online(JournalFile *f) {
                 return -EINVAL;
 
         while (wait) {
-                switch (f->offline_state) {
+                switch (__atomic_load_n(&f->offline_state, __ATOMIC_SEQ_CST)) {
                 case OFFLINE_JOINED:
                         /* No offline thread, no need to wait. */
                         wait = false;
