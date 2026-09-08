@@ -50,9 +50,10 @@ repeating successful file barriers.
 A finalization error, or failure to unlink an unused replacement, latches an error shared by all of the
 manager's journals. Allocation of fresh unique names and adoption of replacement segments
 stop; rotation uses the conventional path until daemon restart. Conventional rotation may reuse the current
-active pathname, including a unique-format name, but archives its predecessor before creating the replacement.
-The latch survives sync drains, journal eviction, configuration reopen and storage changes. Existing finalizers may retry, but success does not clear the latch: previously
-closed files may still need startup recovery.
+active pathname, including a unique-format name. It archives its predecessor before creating the replacement.
+The latch survives sync drains, journal eviction, configuration reopen and storage changes. Existing
+finalizers may retry, but success does not clear the latch: previously closed files may still need startup
+recovery.
 
 This deliberately trades the rotation optimization for a bound under failure. Stranded unique names are
 limited to files already active or in flight when the failure occurs: the bounded active journal population,
