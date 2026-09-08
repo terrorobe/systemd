@@ -31,6 +31,23 @@ switches its in-memory active-file pointer without changing either pathname. Cre
 synchronously is sufficient for this protocol; creating it ahead of time is a separate scheduling choice.
 If segment creation fails, conventional rotation remains available as a fallback.
 
+## Ahead-of-time preparation
+
+Journald can start segment creation after an entry has been appended, while the current file continues
+receiving entries. At most two preparations are retained globally across journal streams. Each worker
+receives copied identity, pathname and policy inputs and performs only the descriptor-based creation
+step. It does not access the active file, mmap cache, event sources or shared FSS state.
+
+A completed preparation is adopted at rotation only if it still belongs to the current file and policy.
+Adoption uses the final sequence boundary, not the earlier snapshot. If no usable segment is ready,
+rotation creates one synchronously using the same segment protocol rather than joining an unfinished
+preparer. Worker failures also fall back to this path after cleanup. Lifecycle/storage changes,
+configuration-driven reopen, memory pressure and shutdown discard unused preparations safely.
+
+The bound covers workers, descriptors and reserved files independently of the number of UIDs. These
+files still count toward filesystem usage. This scheduling policy does not introduce different segment
+names, header states, archive publication or crash-recovery rules.
+
 ## Finalization
 
 The previous file is immutable after handoff. The existing bounded deferred-close machinery completes

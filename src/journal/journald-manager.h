@@ -3,6 +3,7 @@
 
 #include "common-signal.h"
 #include "journal-file.h"
+#include "journal-file-prepare.h"
 #include "journald-config.h"
 #include "journald-forward.h"
 #include "list.h"
@@ -94,6 +95,9 @@ typedef struct Manager {
         MMapCache *mmap;
 
         Set *deferred_closes;
+
+        /* Bound preparers and their reserved files globally, not per UID. */
+        JournalFilePreparation *preparations[2];
 
         uint64_t *kernel_seqnum;
         RateLimit kmsg_own_ratelimit;

@@ -562,6 +562,47 @@ static JournalFile* manager_find_journal(Manager *m, uid_t uid) {
         return m->system_journal;
 }
 
+static void manager_discard_preparations(Manager *m) {
+        FOREACH_ELEMENT(p, m->preparations)
+                *p = journal_file_preparation_free(*p);
+}
+
+static bool manager_preparation_live(Manager *m, JournalFilePreparation *p) {
+        JournalFile *f;
+
+        if (journal_file_preparation_matches(p, m->system_journal) ||
+            journal_file_preparation_matches(p, m->runtime_journal))
+                return true;
+        ORDERED_HASHMAP_FOREACH(f, m->user_journals)
+                if (journal_file_preparation_matches(p, f))
+                        return true;
+        return false;
+}
+
+static void manager_prepare_journal(Manager *m, JournalFile *f) {
+        JournalFileFlags flags;
+        int r;
+
+        flags = manager_get_file_flags(m, f != m->runtime_journal && m->config.seal);
+        if (FLAGS_SET(flags, JOURNAL_SEAL) || JOURNAL_HEADER_SEALED(f->header))
+                return;
+
+        FOREACH_ELEMENT(p, m->preparations) {
+                if (journal_file_preparation_matches(*p, f))
+                        return;
+                if (*p && journal_file_preparation_done(*p) && !manager_preparation_live(m, *p))
+                        *p = journal_file_preparation_free(*p);
+        }
+        FOREACH_ELEMENT(p, m->preparations) {
+                if (*p)
+                        continue;
+                r = journal_file_preparation_start(f, flags, p);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to prepare replacement segment, using synchronous creation: %m");
+                return;
+        }
+}
+
 static int manager_do_rotate(
                 Manager *m,
                 JournalFile **f,
@@ -583,7 +624,16 @@ static int manager_do_rotate(
 
         JournalFile *next = NULL;
         JournalFileFlags flags = manager_get_file_flags(m, seal);
-        if (!FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
+        FOREACH_ELEMENT(p, m->preparations) {
+                if (!journal_file_preparation_matches(*p, *f) || !journal_file_preparation_done(*p))
+                        continue;
+                r = journal_file_preparation_take(*p, *f, flags, m->mmap, &next);
+                if (r < 0)
+                        log_debug_errno(r, "Prepared segment not usable, using synchronous creation: %m");
+                *p = journal_file_preparation_free(*p);
+                break;
+        }
+        if (!next && !FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
                 _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
 
                 r = journal_file_segment_create(*f, flags, &segment);
@@ -1041,6 +1091,7 @@ static void manager_write_to_journal(
                         /* ret_object= */ NULL,
                         /* ret_offset= */ NULL);
         if (r >= 0) {
+                manager_prepare_journal(m, f);
                 manager_schedule_sync(m, priority);
                 return;
         }
@@ -1076,8 +1127,10 @@ static void manager_write_to_journal(
                 log_ratelimit_error_errno(r, FAILED_TO_WRITE_ENTRY_RATELIMIT,
                                           "Failed to write entry to %s (%zu items, %zu bytes) despite vacuuming, ignoring: %m",
                                           f->path, n, iovec_total_size(iovec, n));
-        else
+        else {
+                manager_prepare_journal(m, f);
                 manager_schedule_sync(m, priority);
+        }
 }
 
 #define IOVEC_ADD_NUMERIC_FIELD(iovec, n, value, type, isset, format, field)  \
@@ -1361,6 +1414,8 @@ int manager_flush_to_var(Manager *m, bool require_flag_file) {
         if (!m->system_journal)
                 return 0;
 
+        manager_discard_preparations(m);
+
         /* Offline and close the 'main' runtime journal file to allow the runtime journal to be opened with
          * the SD_JOURNAL_ASSUME_IMMUTABLE flag in the below. */
         m->runtime_journal = journal_file_offline_close(m->runtime_journal);
@@ -1501,6 +1556,7 @@ int manager_relinquish_var(Manager *m) {
         if (m->runtime_journal && !m->system_journal)
                 return 0;
 
+        manager_discard_preparations(m);
         log_debug("Relinquishing %s...", m->system_storage.path);
 
         (void) manager_system_journal_open(m, /* flush_requested= */ false, /* relinquish_requested= */ true);
@@ -2268,6 +2324,7 @@ static int manager_memory_pressure(sd_event_source *es, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
 
         log_info("Under memory pressure, flushing caches.");
+        manager_discard_preparations(m);
 
         /* Flushed the cached info we might have about client processes */
         client_context_flush_regular(m);
@@ -2311,6 +2368,8 @@ void manager_reopen_journals(Manager *m, const JournalConfig *old) {
             journal_metrics_equal(&m->config.system_storage_metrics, &old->system_storage_metrics) &&
             journal_metrics_equal(&m->config.runtime_storage_metrics, &old->runtime_storage_metrics))
                 return; /* no-op */
+
+        manager_discard_preparations(m);
 
         /* Explicitly close the runtime journal to make it reopened later by manager_system_journal_open().
          * But only when volatile (or no) storage is requested. If auto or persistent storage is requested,
@@ -2594,6 +2653,8 @@ void manager_maybe_append_tags(Manager *m) {
 Manager* manager_free(Manager *m) {
         if (!m)
                 return NULL;
+
+        manager_discard_preparations(m);
 
         free(m->namespace);
         free(m->namespace_field);
