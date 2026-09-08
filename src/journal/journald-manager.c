@@ -80,12 +80,8 @@
 /* The period to insert between posting changes for coalescing */
 #define POST_CHANGE_TIMER_INTERVAL_USEC (250*USEC_PER_MSEC)
 
-/* Ordinary rotations historically waited for the previous asynchronous close. Keep one additional
- * generation in flight, but apply backpressure before deferred files and threads can accumulate. */
-#define DEFERRED_CLOSES_MAX 2U
-
-/* Full rotation may discover many closed user journals. Preserve its existing concurrency limit. */
-#define DEFERRED_CLOSES_BULK_MAX 4096U
+#define DEFERRED_CLOSES_ROTATION_MAX      2U
+#define DEFERRED_CLOSES_OFFLINE_USERS_MAX 4096U
 
 #define IDLE_TIMEOUT_USEC (30*USEC_PER_SEC)
 
@@ -724,7 +720,7 @@ static void manager_vacuum_deferred_closes_to(Manager *m, size_t max) {
 }
 
 void manager_vacuum_deferred_closes(Manager *m) {
-        manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_MAX);
+        manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_ROTATION_MAX);
 }
 
 static int manager_archive_offline_user_journals(Manager *m) {
@@ -783,8 +779,7 @@ static int manager_archive_offline_user_journals(Manager *m) {
                         continue;
                 }
 
-                /* Full rotation intentionally dispatches a large bounded batch of closed user journals. */
-                manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_BULK_MAX);
+                manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_OFFLINE_USERS_MAX);
 
                 /* Open the file briefly, so that we can archive it */
                 r = journal_file_open(
