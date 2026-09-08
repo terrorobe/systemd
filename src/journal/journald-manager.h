@@ -24,6 +24,7 @@ typedef struct JournalStorage {
 
         JournalMetrics metrics;
         JournalStorageSpace space;
+        bool segments_recovered;
 } JournalStorage;
 
 /* This structure will be kept in $RUNTIME_DIRECTORY/seqnum and is mapped by journald, and is used to

@@ -195,7 +195,8 @@ int journal_file_set_offline_thread_join(JournalFile *f) {
         if (__atomic_load_n(&f->offline_state, __ATOMIC_SEQ_CST) == OFFLINE_JOINED)
                 return 0;
 
-        log_debug("Joining journal offlining thread for %s.", f->path);
+        /* Deferred archive publication may update the pathname until the join completes. */
+        log_debug("Joining journal offlining thread for fd %i.", f->fd);
 
         r = pthread_join(f->offline_thread, NULL);
         if (r)
@@ -438,6 +439,48 @@ static int journal_file_init_header(
         return 0;
 }
 
+int journal_file_initialize_segment(int fd, JournalFileFlags file_flags, JournalFile *template) {
+        JournalFile f = { .fd = fd };
+        Header h;
+        struct statvfs svfs;
+        uint64_t size;
+        int r;
+
+        assert(fd >= 0);
+        assert(template);
+
+        /* Initialize through descriptor I/O, before adopting the segment into a writable mmap cache.
+         * This also permits callers to isolate creation from the process-wide SIGBUS dispatch machinery. */
+        if (FLAGS_SET(file_flags, JOURNAL_SEAL))
+                return -EOPNOTSUPP;
+
+        size = MIN(FILE_SIZE_INCREASE, template->metrics.max_size ?: FILE_SIZE_INCREASE);
+        if (size < PAGE_ALIGN(sizeof(Header)))
+                return -E2BIG;
+        if (fstatvfs(fd, &svfs) < 0)
+                return -errno;
+        if (LESS_BY(u64_multiply_safe(svfs.f_bavail, svfs.f_bsize), template->metrics.keep_free) < size)
+                return -ENOSPC;
+
+        r = journal_file_init_header(&f, file_flags, template);
+        if (r < 0)
+                return r;
+        r = posix_fallocate_loop(fd, 0, size);
+        if (r < 0)
+                return r;
+        if (pread(fd, &h, sizeof(h), 0) != sizeof(h))
+                return -EIO;
+
+        h.state = STATE_ONLINE;
+        h.arena_size = htole64(size - le64toh(h.header_size));
+        if (pwrite(fd, &h, sizeof(h), 0) != sizeof(h))
+                return -EIO;
+
+        /* Both the empty ONLINE header and its initial name must be durable before adoption. Initialize
+         * hash tables on adoption through the ordinary object constructors, without another sync. */
+        return fsync_full(fd);
+}
+
 static int journal_file_refresh_header(JournalFile *f) {
         int r;
 
@@ -540,7 +583,7 @@ static bool hash_table_is_valid(uint64_t offset, uint64_t size, uint64_t header_
         return true;
 }
 
-static int journal_file_verify_header(JournalFile *f) {
+static int journal_file_verify_header(JournalFile *f, bool new_segment) {
         uint64_t arena_size, header_size;
 
         assert(f);
@@ -727,6 +770,14 @@ static int journal_file_verify_header(JournalFile *f) {
                                                "Trying to open journal file from different host for writing, refusing.");
 
                 state = f->header->state;
+
+                if (new_segment) {
+                        if (state != STATE_ONLINE || n_objects != 0 || n_entries != 0 ||
+                            f->header->field_hash_table_size != 0 || f->header->data_hash_table_size != 0 ||
+                            JOURNAL_HEADER_SEALED(f->header))
+                                return -EBADMSG;
+                        return 0;
+                }
 
                 if (state == STATE_ARCHIVED)
                         return -ESHUTDOWN; /* Already archived */
@@ -4139,7 +4190,7 @@ int journal_file_open(
                 JournalFile *template,
                 JournalFile **ret) {
 
-        bool newly_created = false;
+        bool newly_created = false, new_segment = FLAGS_SET(file_flags, JOURNAL_NEW_SEGMENT);
         JournalFile *f;
         void *h;
         int r;
@@ -4148,6 +4199,11 @@ int journal_file_open(
         assert((file_flags & ~_JOURNAL_FILE_FLAGS_ALL) == 0);
         assert(mmap_cache);
         assert(ret);
+
+        /* Only an explicitly transferred descriptor may bypass the usual unclean-ONLINE rejection. */
+        if (new_segment && (fd < 0 || (open_flags & O_ACCMODE_STRICT) != O_RDWR ||
+                         FLAGS_SET(file_flags, JOURNAL_SEAL)))
+                return -EINVAL;
 
         if (!IN_SET((open_flags & O_ACCMODE_STRICT), O_RDONLY, O_RDWR))
                 return -EINVAL;
@@ -4222,6 +4278,11 @@ int journal_file_open(
         if (r < 0)
                 goto fail;
 
+        if (new_segment && newly_created) {
+                r = -EBADMSG;
+                goto fail;
+        }
+
         if (newly_created) {
                 (void) journal_file_warn_btrfs(f);
 
@@ -4260,7 +4321,7 @@ int journal_file_open(
         f->header = h;
 
         if (!newly_created) {
-                r = journal_file_verify_header(f);
+                r = journal_file_verify_header(f, new_segment);
                 if (r < 0)
                         goto fail;
         }
@@ -4278,12 +4339,14 @@ int journal_file_open(
                 } else if (template)
                         f->metrics = template->metrics;
 
-                r = journal_file_refresh_header(f);
-                if (r < 0)
-                        goto fail;
+                if (!new_segment) {
+                        r = journal_file_refresh_header(f);
+                        if (r < 0)
+                                goto fail;
+                }
         }
 
-        if (newly_created) {
+        if (newly_created || new_segment) {
                 r = journal_file_setup_field_hash_table(f);
                 if (r < 0)
                         goto fail;
@@ -4387,6 +4450,8 @@ int journal_file_parse_uid_from_filename(const char *path, uid_t *ret_uid) {
 
 int journal_file_archive(JournalFile *f, char **ret_previous_path) {
         _cleanup_free_ char *p = NULL;
+        const char *suffix, *name;
+        int r;
 
         assert(f);
 
@@ -4398,11 +4463,16 @@ int journal_file_archive(JournalFile *f, char **ret_previous_path) {
         if (path_startswith(f->path, "/proc/self/fd"))
                 return -EINVAL;
 
-        if (!endswith(f->path, ".journal"))
+        suffix = endswith(f->path, ".journal");
+        if (!suffix)
                 return -EINVAL;
+        name = strrchr(f->path, '/');
+        name = name ? name + 1 : f->path;
+        if (f->deferred_archive && strchr(name, '@'))
+                suffix = strchr(name, '@');
 
         if (asprintf(&p, "%.*s@" SD_ID128_FORMAT_STR "-%016"PRIx64"-%016"PRIx64".journal",
-                     (int) strlen(f->path) - 8, f->path,
+                     (int) (suffix - f->path), f->path,
                      SD_ID128_FORMAT_VAL(f->header->seqnum_id),
                      le64toh(f->header->head_entry_seqnum),
                      le64toh(f->header->head_entry_realtime)) < 0)
@@ -4410,7 +4480,11 @@ int journal_file_archive(JournalFile *f, char **ret_previous_path) {
 
         /* Try to rename the file to the archived version. If the file already was deleted, we'll get ENOENT, let's
          * ignore that case. */
-        if (rename(f->path, p) < 0 && errno != ENOENT)
+        if (f->deferred_archive) {
+                r = rename_noreplace(AT_FDCWD, f->path, AT_FDCWD, p);
+                if (r < 0)
+                        return r;
+        } else if (rename(f->path, p) < 0 && errno != ENOENT)
                 return -errno;
 
         /* Sync the rename to disk */
@@ -4427,6 +4501,7 @@ int journal_file_archive(JournalFile *f, char **ret_previous_path) {
          * the archive state by setting an archive bit, leaving the state as STATE_ONLINE so proper offlining
          * occurs. */
         f->archive = true;
+        f->deferred_archive = false;
 
         return 0;
 }

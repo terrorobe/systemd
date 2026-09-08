@@ -112,6 +112,7 @@ shared_sources = files(
         'ip-protocol-list.c',
         'ipvlan-util.c',
         'journal-authenticate.c',
+        'journal-file-segment.c',
         'journal-file-util.c',
         'journal-importer.c',
         'journal-util.c',

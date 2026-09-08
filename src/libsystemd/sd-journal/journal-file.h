@@ -61,6 +61,8 @@ typedef struct JournalFile {
         bool close_fd:1;
         bool archive:1;
         bool strict_order:1;
+        /* Keep a unique, durable non-archive name until finalization has completed. */
+        bool deferred_archive:1;
 
         direction_t last_direction;
         LocationType location_type;
@@ -115,7 +117,9 @@ typedef enum JournalFileFlags {
         JOURNAL_COMPRESS        = 1 << 0,
         JOURNAL_SEAL            = 1 << 1,
         JOURNAL_STRICT_ORDER    = 1 << 2,
-        _JOURNAL_FILE_FLAGS_ALL = JOURNAL_COMPRESS|JOURNAL_SEAL|JOURNAL_STRICT_ORDER,
+        /* Internal handoff of an empty file initialized and synced by journal_file_initialize_segment(). */
+        JOURNAL_NEW_SEGMENT     = 1 << 3,
+        _JOURNAL_FILE_FLAGS_ALL = JOURNAL_COMPRESS|JOURNAL_SEAL|JOURNAL_STRICT_ORDER|JOURNAL_NEW_SEGMENT,
 } JournalFileFlags;
 
 typedef struct {
@@ -137,6 +141,7 @@ int journal_file_open(
                 JournalFile *template,
                 JournalFile **ret);
 
+int journal_file_initialize_segment(int fd, JournalFileFlags file_flags, JournalFile *template);
 int journal_file_set_offline_thread_join(JournalFile *f);
 JournalFile* journal_file_close(JournalFile *f);
 int journal_file_fstat(JournalFile *f);

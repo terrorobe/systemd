@@ -198,6 +198,14 @@ static void journal_file_set_offline_internal(JournalFile *f) {
                         f->header->state = f->archive ? STATE_ARCHIVED : STATE_OFFLINE;
                         (void) fsync(f->fd);
 
+                        /* Unique segment names were made durable before adoption and are not vacuum
+                         * candidates. Publish the ordinary archive name only after both file barriers. */
+                        if (f->archive && f->deferred_archive) {
+                                r = journal_file_archive(f, NULL);
+                                if (r < 0)
+                                        log_debug_errno(r, "Failed to publish archived segment, retaining recoverable name: %m");
+                        }
+
                         /* If we've archived the journal file, first try to re-enable COW on the file. If the
                          * FS_NOCOW_FL flag was never set or we successfully removed it, continue. If we fail
                          * to remove the flag on the archived file, rewrite the file without the NOCOW flag.
@@ -419,6 +427,10 @@ JournalFile* journal_file_offline_close(JournalFile *f) {
                 journal_file_post_change(f);
         f->post_change_timer = sd_event_source_disable_unref(f->post_change_timer);
 
+        if (f->deferred_archive) {
+                (void) journal_file_set_offline_thread_join(f);
+                f->archive = true;
+        }
         journal_file_set_offline(f, true);
 
         return journal_file_close(f);
@@ -480,10 +492,13 @@ int journal_file_rotate(
 
         _cleanup_free_ char *path = NULL;
         JournalFile *new_file = NULL;
+        bool deferred_archive;
         int r;
 
         assert(f);
         assert(*f);
+
+        deferred_archive = (*f)->deferred_archive;
 
         r = journal_file_auth_append_tag(*f);
         if (r < 0)
@@ -505,6 +520,8 @@ int journal_file_rotate(
                         /* template= */ *f,
                         &new_file);
 
+        if (new_file)
+                new_file->deferred_archive = deferred_archive;
         journal_file_initiate_close(*f, deferred_closes);
         *f = new_file;
 

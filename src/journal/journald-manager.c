@@ -31,6 +31,7 @@
 #include "initrd-util.h"
 #include "iovec-util.h"
 #include "journal-authenticate.h"
+#include "journal-file-segment.h"
 #include "journal-file-util.h"
 #include "journal-internal.h"
 #include "journal-vacuum.h"
@@ -373,6 +374,13 @@ static int manager_system_journal_open(
 
                 (void) mkdir(m->system_storage.path, 0755);
 
+                if (!m->system_storage.segments_recovered) {
+                        r = journal_file_recover_segments(m->system_storage.path);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to recover system journal segments: %m");
+                        m->system_storage.segments_recovered = true;
+                }
+
                 fn = strjoina(m->system_storage.path, "/system.journal");
                 r = manager_open_journal(
                                 m,
@@ -406,6 +414,13 @@ static int manager_system_journal_open(
 
         if (!m->runtime_journal &&
             (m->config.storage != STORAGE_NONE)) {
+
+                if (!m->runtime_storage.segments_recovered) {
+                        r = journal_file_recover_segments(m->runtime_storage.path);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to recover runtime journal segments: %m");
+                        m->runtime_storage.segments_recovered = true;
+                }
 
                 fn = strjoina(m->runtime_storage.path, "/system.journal");
 
@@ -566,7 +581,22 @@ static int manager_do_rotate(
 
         manager_vacuum_deferred_closes(m);
 
-        r = journal_file_rotate(f, m->mmap, manager_get_file_flags(m, seal), m->config.compress.threshold_bytes, m->deferred_closes);
+        JournalFile *next = NULL;
+        JournalFileFlags flags = manager_get_file_flags(m, seal);
+        if (!FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
+                _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
+
+                r = journal_file_segment_create(*f, flags, &segment);
+                if (r >= 0)
+                        r = journal_file_segment_adopt(segment, *f, flags, m->mmap, &next);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to create replacement segment, using conventional rotation: %m");
+        }
+
+        if (next)
+                r = journal_file_rotate_segment(f, next, m->deferred_closes);
+        else
+                r = journal_file_rotate(f, m->mmap, flags, m->config.compress.threshold_bytes, m->deferred_closes);
         if (r < 0) {
                 if (*f)
                         return log_ratelimit_error_errno(r, JOURNAL_LOG_RATELIMIT,

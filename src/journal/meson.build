@@ -123,6 +123,9 @@ executables += [
                 ],
                 'install' : get_option('link-journalctl-shared') ? 'yes' : 'static',
         },
+        test_template + {
+                'sources' : files('test-journal-segment.c'),
+        },
         journal_test_template + {
                 'sources' : files('test-audit-type.c'),
         },
