@@ -187,7 +187,7 @@ Manager* manager_free(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 void manager_full_sync(Manager *m, bool wait);
 void manager_vacuum(Manager *m, bool verbose);
-void manager_vacuum_deferred_closes(Manager *m);
+void manager_vacuum_deferred_closes(Manager *m, size_t max);
 void manager_rotate(Manager *m);
 void manager_full_rotate(Manager *m);
 int manager_flush_to_var(Manager *m, bool require_flag_file);

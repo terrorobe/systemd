@@ -134,7 +134,7 @@ static void deferred_close_fixture_done(DeferredCloseFixture *fixture) {
 static void *vacuum_deferred_closes_thread(void *userdata) {
         AsyncCall *call = ASSERT_PTR(userdata);
 
-        manager_vacuum_deferred_closes(call->manager);
+        manager_vacuum_deferred_closes(call->manager, N_DEFERRED_CLOSES);
         atomic_store(&call->done, true);
         return NULL;
 }
@@ -234,7 +234,7 @@ TEST(completed_deferred_close_is_reaped_first) {
         deferred_close_fixture_release(fixtures + 0);
         deferred_close_fixture_wait(fixtures + 0);
 
-        manager_vacuum_deferred_closes(&manager);
+        manager_vacuum_deferred_closes(&manager, N_DEFERRED_CLOSES);
         ASSERT_EQ(set_size(manager.deferred_closes), 1u);
         ASSERT_TRUE(journal_file_is_offlining(fixtures[1].file));
 
