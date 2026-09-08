@@ -84,6 +84,9 @@
  * generation in flight, but apply backpressure before deferred files and threads can accumulate. */
 #define DEFERRED_CLOSES_MAX 2U
 
+/* Full rotation may discover many closed user journals. Preserve its existing concurrency limit. */
+#define DEFERRED_CLOSES_BULK_MAX 4096U
+
 #define IDLE_TIMEOUT_USEC (30*USEC_PER_SEC)
 
 #define FAILED_TO_WRITE_ENTRY_RATELIMIT ((const RateLimit) { .interval = 1 * USEC_PER_SEC, .burst = 1 })
@@ -700,23 +703,28 @@ static void manager_process_deferred_closes(Manager *m) {
         }
 }
 
-void manager_vacuum_deferred_closes(Manager *m) {
+static void manager_vacuum_deferred_closes_to(Manager *m, size_t max) {
         assert(m);
+        assert(max > 0);
 
         /* Make some room in the deferred closes list, so that it doesn't grow without bounds */
-        if (set_size(m->deferred_closes) < DEFERRED_CLOSES_MAX)
+        if (set_size(m->deferred_closes) < max)
                 return;
 
         /* Let's first remove all journal files that might already have completed closing */
         manager_process_deferred_closes(m);
 
         /* And now, let's close some more until we reach the limit again. */
-        while (set_size(m->deferred_closes) >= DEFERRED_CLOSES_MAX) {
+        while (set_size(m->deferred_closes) >= max) {
                 JournalFile *f;
 
                 assert_se(f = set_steal_first(m->deferred_closes));
                 journal_file_deferred_close(f);
         }
+}
+
+void manager_vacuum_deferred_closes(Manager *m) {
+        manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_MAX);
 }
 
 static int manager_archive_offline_user_journals(Manager *m) {
@@ -775,8 +783,8 @@ static int manager_archive_offline_user_journals(Manager *m) {
                         continue;
                 }
 
-                /* Make some room in the set of deferred close()s */
-                manager_vacuum_deferred_closes(m);
+                /* Full rotation intentionally dispatches a large bounded batch of closed user journals. */
+                manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_BULK_MAX);
 
                 /* Open the file briefly, so that we can archive it */
                 r = journal_file_open(
