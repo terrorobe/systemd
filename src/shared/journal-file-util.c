@@ -220,7 +220,7 @@ static void journal_file_set_offline_internal(JournalFile *f) {
                          * namespace errors without repeating completed file synchronization. Conventional
                          * active-file synchronization retains its existing error semantics. */
                         if (f->archive && f->deferred_archive) {
-                                r = journal_file_publish_archive(f);
+                                r = journal_file_publish_deferred_archive(f);
                                 if (r < 0)
                                         return journal_file_offline_failed(f, r);
                         }
