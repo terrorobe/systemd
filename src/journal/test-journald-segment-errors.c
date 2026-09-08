@@ -243,7 +243,7 @@ static void rotate(Fixture *t) {
         JournalFile *next = NULL;
         Manager m = { .deferred_closes = t->deferred };
 
-        manager_vacuum_deferred_closes(&m);
+        manager_vacuum_deferred_closes(&m, /* max= */ 2);
         ASSERT_OK(journal_file_segment_create(t->file, /* flags= */ 0, &segment));
         ASSERT_OK(journal_file_segment_adopt(segment, t->file, /* flags= */ 0, t->mmap, &next));
         ASSERT_OK(journal_file_rotate_segment(&t->file, next, t->deferred));
