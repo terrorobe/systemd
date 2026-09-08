@@ -320,7 +320,7 @@ void journal_file_dump(JournalFile *f);
 void journal_file_print_header(JournalFile *f);
 
 int journal_file_archive(JournalFile *f, char **ret_previous_path);
-int journal_file_publish_archive(JournalFile *f);
+int journal_file_publish_deferred_archive(JournalFile *f);
 int journal_file_parse_uid_from_filename(const char *path, uid_t *uid);
 
 int journal_file_dispose(int dir_fd, const char *fname);
