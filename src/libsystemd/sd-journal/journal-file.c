@@ -204,7 +204,7 @@ int journal_file_set_offline_thread_join(JournalFile *f) {
 
         log_debug("Journal offlining thread for %s joined.", f->path);
 
-        __atomic_store_n(&f->offline_state, OFFLINE_JOINED, __ATOMIC_SEQ_CST);
+        f->offline_state = OFFLINE_JOINED;
 
         if (mmap_cache_fd_got_sigbus(f->cache_fd))
                 return -EIO;
