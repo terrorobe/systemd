@@ -22,11 +22,25 @@
 #include "time-util.h"
 #include "tmpfile-util.h"
 
+typedef enum IOFault {
+        IO_FAULT_NONE,
+        IO_FAULT_SHORT,
+        IO_FAULT_ZERO,
+        IO_FAULT_EIO,
+        IO_FAULT_EINTR,
+        _IO_FAULT_MAX,
+        _IO_FAULT_INVALID = -EINVAL,
+} IOFault;
+
 /* Fault injection is confined to this test executable. Returning test failures keeps fixture cleanup
  * active and allows the same regressions to run under sanitizers. */
 static atomic_bool fail_directory_sync, fail_regular_sync, fail_rename, fail_unlink;
 static atomic_int fail_fd = -1, allocation_error, mask_failure;
 static atomic_uint failed_syncs, failed_renames, regular_syncs, regular_syncs_before_failure;
+static atomic_int read_fault, write_fault, read_skip, write_skip;
+static atomic_uint injected_io;
+static ssize_t (*real_pread)(int, void*, size_t, off_t);
+static ssize_t (*real_pwrite)(int, const void*, size_t, off_t);
 static int (*real_fsync)(int);
 static int (*real_unlink)(const char*);
 static int (*real_renameat2)(int, const char*, int, const char*, unsigned);
@@ -37,6 +51,10 @@ static pthread_once_t symbols_once = PTHREAD_ONCE_INIT;
 static void resolve_symbols(void) {
         void *p;
 
+        p = ASSERT_NOT_NULL(dlsym(RTLD_NEXT, "pread64"));
+        memcpy(&real_pread, &p, sizeof(p));
+        p = ASSERT_NOT_NULL(dlsym(RTLD_NEXT, "pwrite64"));
+        memcpy(&real_pwrite, &p, sizeof(p));
         p = ASSERT_NOT_NULL(dlsym(RTLD_NEXT, "unlink"));
         memcpy(&real_unlink, &p, sizeof(p));
         p = ASSERT_NOT_NULL(dlsym(RTLD_NEXT, "fsync"));
@@ -47,6 +65,57 @@ static void resolve_symbols(void) {
         memcpy(&real_posix_fallocate, &p, sizeof(p));
         p = ASSERT_NOT_NULL(dlsym(RTLD_NEXT, "pthread_sigmask"));
         memcpy(&real_pthread_sigmask, &p, sizeof(p));
+}
+
+/* Arm only around the synchronous constructor/recovery call. A fault is consumed once; short I/O
+ * actually transfers one byte. This models descriptor I/O, not mmap writeback or heap exhaustion. */
+static IOFault take_io_fault(atomic_int *mode, atomic_int *skip) {
+        IOFault fault;
+
+        if (atomic_load(mode) == IO_FAULT_NONE || atomic_fetch_sub(skip, 1) > 0)
+                return IO_FAULT_NONE;
+        fault = atomic_exchange(mode, IO_FAULT_NONE);
+        if (fault != IO_FAULT_NONE)
+                atomic_fetch_add(&injected_io, 1);
+        return fault;
+}
+
+__attribute__((visibility("default")))
+ssize_t pread(int fd, void *buf, size_t size, off_t offset) {
+        IOFault fault;
+
+        assert_se(pthread_once(&symbols_once, resolve_symbols) == 0);
+        fault = take_io_fault(&read_fault, &read_skip);
+        if (IN_SET(fault, IO_FAULT_EIO, IO_FAULT_EINTR)) {
+                errno = fault == IO_FAULT_EIO ? EIO : EINTR;
+                return -1;
+        }
+        if (fault == IO_FAULT_ZERO)
+                return 0;
+        if (fault == IO_FAULT_SHORT) {
+                ASSERT_GT(size, 1U);
+                size = 1;
+        }
+        return real_pread(fd, buf, size, offset);
+}
+
+__attribute__((visibility("default")))
+ssize_t pwrite(int fd, const void *buf, size_t size, off_t offset) {
+        IOFault fault;
+
+        assert_se(pthread_once(&symbols_once, resolve_symbols) == 0);
+        fault = take_io_fault(&write_fault, &write_skip);
+        if (IN_SET(fault, IO_FAULT_EIO, IO_FAULT_EINTR)) {
+                errno = fault == IO_FAULT_EIO ? EIO : EINTR;
+                return -1;
+        }
+        if (fault == IO_FAULT_ZERO)
+                return 0;
+        if (fault == IO_FAULT_SHORT) {
+                ASSERT_GT(size, 1U);
+                size = 1;
+        }
+        return real_pwrite(fd, buf, size, offset);
 }
 
 __attribute__((visibility("default")))
@@ -123,6 +192,10 @@ typedef struct Fixture {
 } Fixture;
 
 static void fixture_done(Fixture *t) {
+        atomic_store(&read_fault, IO_FAULT_NONE);
+        atomic_store(&write_fault, IO_FAULT_NONE);
+        atomic_store(&read_skip, 0);
+        atomic_store(&write_skip, 0);
         atomic_store(&fail_regular_sync, false);
         atomic_store(&fail_directory_sync, false);
         atomic_store(&fail_rename, false);
@@ -212,7 +285,7 @@ TEST(segment_initial_sync_failures) {
 TEST(segment_allocation_failures) {
         int e;
 
-        FOREACH_ARGUMENT(e, ENOSPC, EDQUOT, EROFS, EIO) {
+        FOREACH_ARGUMENT(e, ENOSPC, EDQUOT, EROFS, EIO, ENOMEM) {
                 _cleanup_(fixture_done) Fixture t = {};
                 _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
 
@@ -540,6 +613,99 @@ TEST(segment_empty_recovery) {
                         ASSERT_OK_ERRNO(fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW));
                         ASSERT_FALSE(st.st_ino == before.st_ino && st.st_dev == before.st_dev);
                 }
+        }
+}
+
+TEST(segment_constructor_short_io) {
+        static const struct {
+                const char *name;
+                bool read;
+                unsigned writes_to_skip;
+        } steps[] = {
+                { .name = "initial header write" },
+                { .name = "header readback", .read = true },
+                { .name = "final header write", .writes_to_skip = 1 },
+        };
+
+        FOREACH_ELEMENT(step, steps) {
+                IOFault fault;
+
+                FOREACH_ARGUMENT(fault, IO_FAULT_SHORT, IO_FAULT_ZERO, IO_FAULT_EIO) {
+                        _cleanup_(fixture_done) Fixture t = {};
+                        _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
+
+                        log_info("Constructor %s: I/O fault %i", step->name, fault);
+                        fixture_init(&t);
+                        atomic_store(&injected_io, 0);
+                        atomic_store(step->read ? &read_fault : &write_fault, fault);
+                        atomic_store(&write_skip, step->writes_to_skip);
+                        /* Failure must not hand out an incomplete segment, regardless of errno mapping. */
+                        ASSERT_LT(journal_file_segment_create(t.file, /* flags= */ 0, &segment), 0);
+                        ASSERT_EQ(atomic_load(&injected_io), 1U);
+                        ASSERT_NULL(segment);
+                        ASSERT_EQ(count_unique(t.directory), 0U);
+                        append(&t);
+                        ASSERT_OK(journal_file_segment_create(t.file, /* flags= */ 0, &segment));
+                }
+        }
+}
+
+TEST(segment_recovery_short_io) {
+        static const struct {
+                const char *name;
+                IOFault fault;
+                bool arena, preserve, nonzero_data;
+        } cases[] = {
+                { .name = "short header", .fault = IO_FAULT_SHORT, .preserve = true },
+                { .name = "header EOF", .fault = IO_FAULT_ZERO, .preserve = true },
+                { .name = "header error", .fault = IO_FAULT_EIO, .preserve = true },
+                { .name = "short arena read", .fault = IO_FAULT_SHORT, .arena = true },
+                { .name = "arena EOF", .fault = IO_FAULT_ZERO, .arena = true, .preserve = true },
+                { .name = "arena error", .fault = IO_FAULT_EIO, .arena = true, .preserve = true },
+                { .name = "interrupted arena read", .fault = IO_FAULT_EINTR, .arena = true },
+                { .name = "short arena read before nonzero data", .fault = IO_FAULT_SHORT,
+                  .arena = true, .preserve = true, .nonzero_data = true },
+        };
+
+        FOREACH_ELEMENT(c, cases) {
+                _cleanup_(fixture_done) Fixture t = {};
+                _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
+                _cleanup_closedir_ DIR *d = NULL;
+                struct stat original;
+                bool preserved = false;
+                int r;
+
+                log_info("Recovery: %s", c->name);
+                fixture_init(&t);
+                ASSERT_OK(journal_file_segment_create(t.file, /* flags= */ 0, &segment));
+                /* The short arena read returns only the first zero byte. The following nonzero byte
+                 * must still be scanned, not skipped by advancing past the whole requested buffer. */
+                if (c->nonzero_data)
+                        ASSERT_OK_EQ_ERRNO(pwrite(segment->fd, "x", 1, sizeof(Header) + 1), 1);
+                ASSERT_OK_ERRNO(fstat(segment->fd, &original));
+                segment->fd = safe_close(segment->fd);
+                atomic_store(&injected_io, 0);
+                atomic_store(&read_fault, c->fault);
+                atomic_store(&read_skip, c->arena); /* The header read precedes the arena scan. */
+                r = journal_file_recover_segments(t.directory);
+                ASSERT_EQ(atomic_load(&injected_io), 1U);
+                if (c->fault == IO_FAULT_EIO)
+                        ASSERT_LT(r, 0);
+                else
+                        ASSERT_OK(r);
+                d = ASSERT_NOT_NULL(opendir(t.directory));
+                FOREACH_DIRENT_ALL(de, d, assert_not_reached()) {
+                        struct stat st;
+
+                        ASSERT_OK_ERRNO(fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW));
+                        if (st.st_ino == original.st_ino && st.st_dev == original.st_dev)
+                                preserved = true;
+                }
+                ASSERT_EQ(preserved, c->preserve);
+                /* Retry after the one-shot fault, including after ambiguous images have been renamed. */
+                ASSERT_OK(journal_file_recover_segments(t.directory));
+                ASSERT_OK(journal_file_recover_segments(t.directory));
+                append(&t);
         }
 }
 
