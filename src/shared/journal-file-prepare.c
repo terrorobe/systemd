@@ -37,6 +37,10 @@ int journal_file_preparation_start(JournalFile *f, JournalFileFlags flags, Journ
         assert(f);
         assert(ret);
 
+        r = journal_file_segment_state_error(f->segment_state);
+        if (r < 0)
+                return r;
+
         if (FLAGS_SET(flags, JOURNAL_SEAL) || JOURNAL_HEADER_SEALED(f->header))
                 return -EOPNOTSUPP;
         p = new(JournalFilePreparation, 1);
@@ -56,13 +60,15 @@ int journal_file_preparation_start(JournalFile *f, JournalFileFlags flags, Journ
                 .metrics = f->metrics,
                 .mode = f->mode,
                 .compress_threshold_bytes = f->compress_threshold_bytes,
+                .segment_state = f->segment_state,
                 .path = strdup(f->path),
         };
         if (!p->template.path)
                 return -ENOMEM;
 
-        /* The worker receives only copied inputs. It never accesses the active JournalFile, mmap cache,
-         * event source, or FSS state. The active file may even be closed before preparation completes. */
+        /* File/policy inputs are copied; only the owner's atomic error latch is shared. The worker never
+         * accesses the active JournalFile, mmap cache, event source, or FSS state. The active file may be
+         * closed before preparation completes, but the owner must outlive the worker. */
         r = pthread_create(&p->thread, NULL, journal_file_prepare_thread, p);
         if (r != 0)
                 return -r;

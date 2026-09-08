@@ -96,6 +96,10 @@ typedef struct Manager {
 
         Set *deferred_closes;
 
+        /* Shared by all journals/preparations; remains latched across reopen, eviction and storage changes. */
+        JournalFileSegmentState segment_state;
+        bool segment_error_warned;
+
         /* Bound preparers and their reserved files globally, not per UID. */
         JournalFilePreparation *preparations[2];
 

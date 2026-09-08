@@ -4226,6 +4226,7 @@ int journal_file_open(
                                             DEFAULT_COMPRESS_THRESHOLD :
                                             MAX(MIN_COMPRESS_THRESHOLD, compress_threshold_bytes),
                 .strict_order = FLAGS_SET(file_flags, JOURNAL_STRICT_ORDER),
+                .segment_state = template ? template->segment_state : NULL,
                 .newest_boot_id_prioq_idx = PRIOQ_IDX_NULL,
                 .last_direction = _DIRECTION_INVALID,
                 .tail_timestamp_ratelimit = { .interval = USEC_PER_SEC, .burst = 1 },
@@ -4448,7 +4449,7 @@ int journal_file_parse_uid_from_filename(const char *path, uid_t *ret_uid) {
         return parse_uid(buf, ret_uid);
 }
 
-int journal_file_archive(JournalFile *f, char **ret_previous_path) {
+static int journal_file_archive_internal(JournalFile *f, char **ret_previous_path, bool synchronize) {
         _cleanup_free_ char *p = NULL;
         const char *suffix, *name;
         int r;
@@ -4487,8 +4488,10 @@ int journal_file_archive(JournalFile *f, char **ret_previous_path) {
         } else if (rename(f->path, p) < 0 && errno != ENOENT)
                 return -errno;
 
-        /* Sync the rename to disk */
-        (void) fsync_directory_of_file(f->fd);
+        /* The conventional path keeps its existing error behavior. Deferred publication handles this
+         * barrier separately so a failed directory sync can be retried without repeating the rename. */
+        if (synchronize)
+                (void) fsync_directory_of_file(f->fd);
 
         if (ret_previous_path)
                 *ret_previous_path = TAKE_PTR(f->path);
@@ -4500,9 +4503,43 @@ int journal_file_archive(JournalFile *f, char **ret_previous_path) {
          * which would result in the rotated journal never getting fsync() called before closing.  Now we simply queue
          * the archive state by setting an archive bit, leaving the state as STATE_ONLINE so proper offlining
          * occurs. */
-        f->archive = true;
+        if (synchronize)
+                f->archive = true;
+        else
+                assert(f->archive); /* Immutable deferred archive; do not rewrite the shared flags byte. */
         f->deferred_archive = false;
 
+        return 0;
+}
+
+int journal_file_archive(JournalFile *f, char **ret_previous_path) {
+        return journal_file_archive_internal(f, ret_previous_path, /* synchronize= */ true);
+}
+
+int journal_file_publish_archive(JournalFile *f) {
+        int r;
+
+        assert(f);
+        assert(f->archive);
+        assert(f->archive_data_synced);
+        assert(f->deferred_archive);
+
+        if (!f->archive_directory_sync_pending) {
+                r = journal_file_archive_internal(f, /* ret_previous_path= */ NULL, /* synchronize= */ false);
+                if (r < 0)
+                        return r;
+                f->deferred_archive = true;
+                f->archive_directory_sync_pending = true;
+        }
+
+        /* f->path now names the actual renamed file even if this sync fails. Retry only this obligation,
+         * not the completed file barriers or a no-overwrite rename onto the file's own name. */
+        r = fsync_directory_of_file(f->fd);
+        if (r < 0)
+                return r;
+
+        f->archive_directory_sync_pending = false;
+        f->deferred_archive = false;
         return 0;
 }
 

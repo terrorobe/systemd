@@ -250,7 +250,9 @@ int journal_directory_vacuum(
                         continue;
                 }
 
-                r = journal_file_empty(dirfd(d), p);
+                /* A .journal~ name denotes a possibly damaged image. Its entry counter (or even header
+                 * length) cannot prove emptiness. Apply normal retention, not unconditional deletion. */
+                r = have_seqnum ? journal_file_empty(dirfd(d), p) : 0;
                 if (r < 0) {
                         log_debug_errno(r, "Failed to check if %s is empty, ignoring: %m", p);
                         continue;

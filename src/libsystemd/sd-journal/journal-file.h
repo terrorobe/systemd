@@ -51,6 +51,26 @@ typedef enum OfflineState {
         OFFLINE_DONE,
 } OfflineState;
 
+/* Owner-scoped circuit breaker for unique segment names. The owner must outlive every attached file and
+ * preparation, including their workers. Once finalization or unused-file cleanup fails, do not reset this while running:
+ * already closed files may still need startup recovery. Access the shared error only through these helpers. */
+typedef struct JournalFileSegmentState {
+        int error;
+} JournalFileSegmentState;
+
+static inline int journal_file_segment_state_error(const JournalFileSegmentState *state) {
+        return state ? __atomic_load_n(&state->error, __ATOMIC_SEQ_CST) : 0;
+}
+
+static inline void journal_file_segment_state_fail(JournalFileSegmentState *state, int error) {
+        int expected = 0;
+
+        assert(error < 0);
+        if (state)
+                (void) __atomic_compare_exchange_n(&state->error, &expected, error, false,
+                                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
 typedef struct JournalFile {
         int fd;
         MMapFileDescriptor *cache_fd;
@@ -62,7 +82,12 @@ typedef struct JournalFile {
         bool archive:1;
         bool strict_order:1;
         /* Keep a unique, durable non-archive name until finalization has completed. */
-        bool deferred_archive:1;
+        bool deferred_archive;
+        /* Worker-owned publication progress; inspect only after joining offlining. Keep these out of the
+         * bitfield containing immutable flags, to avoid cross-thread read/modify/write of a shared byte. */
+        bool archive_data_synced;
+        bool archive_directory_sync_pending;
+        JournalFileSegmentState *segment_state;
 
         direction_t last_direction;
         LocationType location_type;
@@ -92,6 +117,7 @@ typedef struct JournalFile {
 
         pthread_t offline_thread;
         volatile OfflineState offline_state;
+        int offline_error; /* written by offlining, consumed after join */
 
         unsigned last_seen_generation;
 
@@ -294,6 +320,7 @@ void journal_file_dump(JournalFile *f);
 void journal_file_print_header(JournalFile *f);
 
 int journal_file_archive(JournalFile *f, char **ret_previous_path);
+int journal_file_publish_archive(JournalFile *f);
 int journal_file_parse_uid_from_filename(const char *path, uid_t *uid);
 
 int journal_file_dispose(int dir_fd, const char *fname);

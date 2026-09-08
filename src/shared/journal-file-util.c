@@ -144,6 +144,14 @@ static int journal_file_punch_holes(JournalFile *f) {
         return 0;
 }
 
+static void journal_file_offline_failed(JournalFile *f, int error) {
+        assert(error < 0);
+
+        f->offline_error = error;
+        journal_file_segment_state_fail(f->segment_state, error);
+        __atomic_store_n(&f->offline_state, OFFLINE_DONE, __ATOMIC_SEQ_CST);
+}
+
 /* This may be called from a separate thread to prevent blocking the caller for the duration of fsync().
  * As a result we use atomic operations on f->offline_state for inter-thread communications with
  * journal_file_set_offline() and journal_file_set_online(). */
@@ -181,12 +189,16 @@ static void journal_file_set_offline_internal(JournalFile *f) {
                         break;
 
                 case OFFLINE_SYNCING:
-                        if (f->archive) {
-                                (void) journal_file_end_punch_hole(f);
-                                (void) journal_file_punch_holes(f);
-                        }
+                        if (!f->archive_data_synced) {
+                                if (f->archive) {
+                                        (void) journal_file_end_punch_hole(f);
+                                        (void) journal_file_punch_holes(f);
+                                }
 
-                        (void) fsync(f->fd);
+                                r = RET_NERRNO(fsync(f->fd));
+                                if (r < 0 && f->archive && f->deferred_archive)
+                                        return journal_file_offline_failed(f, r);
+                        }
 
                         {
                                 OfflineState tmp_state = OFFLINE_SYNCING;
@@ -195,15 +207,22 @@ static void journal_file_set_offline_internal(JournalFile *f) {
                                         continue;
                         }
 
-                        f->header->state = f->archive ? STATE_ARCHIVED : STATE_OFFLINE;
-                        (void) fsync(f->fd);
+                        if (!f->archive_data_synced) {
+                                f->header->state = f->archive ? STATE_ARCHIVED : STATE_OFFLINE;
+                                r = RET_NERRNO(fsync(f->fd));
+                                if (r < 0 && f->archive && f->deferred_archive)
+                                        return journal_file_offline_failed(f, r);
+                                if (f->archive && f->deferred_archive)
+                                        f->archive_data_synced = true;
+                        }
 
-                        /* Unique segment names were made durable before adoption and are not vacuum
-                         * candidates. Publish the ordinary archive name only after both file barriers. */
+                        /* Require successful barriers before publishing an immutable predecessor. Retry
+                         * namespace errors without repeating completed file synchronization. Conventional
+                         * active-file synchronization retains its existing error semantics. */
                         if (f->archive && f->deferred_archive) {
-                                r = journal_file_archive(f, NULL);
+                                r = journal_file_publish_archive(f);
                                 if (r < 0)
-                                        log_debug_errno(r, "Failed to publish archived segment, retaining recoverable name: %m");
+                                        return journal_file_offline_failed(f, r);
                         }
 
                         /* If we've archived the journal file, first try to re-enable COW on the file. If the
@@ -328,10 +347,11 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
 
         target_state = f->archive ? STATE_ARCHIVED : STATE_OFFLINE;
 
+        /* The worker may be publishing a new pathname. Do not read f->path before joining it. */
         log_ratelimit_full(LOG_DEBUG,
                            JOURNAL_LOG_RATELIMIT,
-                           "Journal file %s is %s transitioning to %s.",
-                           f->path,
+                           "Journal file descriptor %i is %s transitioning to %s.",
+                           f->fd,
                            wait ? "synchronously" : "asynchronously",
                            f->archive ? "archived" : "offline");
 
@@ -339,7 +359,8 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
          * we must also join any potentially lingering offline thread when already in
          * the desired offline state.
          */
-        if (!journal_file_is_offlining(f) && f->header->state == target_state) {
+        if (!journal_file_is_offlining(f) && f->header->state == target_state &&
+            f->offline_error >= 0 && !(f->archive && f->deferred_archive)) {
                 log_ratelimit_full(LOG_DEBUG,
                                    JOURNAL_LOG_RATELIMIT,
                                    "Journal file %s is already %s, waiting for offlining thread.",
@@ -357,7 +378,7 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
         }
 
         if (restarted)
-                return 0;
+                return wait ? f->offline_error : 0;
 
         log_ratelimit_full(LOG_DEBUG,
                            JOURNAL_LOG_RATELIMIT,
@@ -365,7 +386,8 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
                            wait ? "synchronous" : "asynchronous",
                            f->path);
 
-        /* Initiate a new offline. */
+        /* Initiate a new offline. The previous worker has been joined before resetting its result. */
+        f->offline_error = 0;
         __atomic_store_n(&f->offline_state, OFFLINE_SYNCING, __ATOMIC_SEQ_CST);
 
         if (wait) {
@@ -401,7 +423,7 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
                         return -k;
         }
 
-        return 0;
+        return wait ? f->offline_error : 0;
 }
 
 bool journal_file_is_offlining(JournalFile *f) {
@@ -448,7 +470,8 @@ JournalFile* journal_file_deferred_close(JournalFile *f) {
         if (r < 0)
                 log_debug_errno(r, "Failed to join journal offlining thread for '%s', ignoring: %m", f->path);
 
-        if (f->header->state != (f->archive ? STATE_ARCHIVED : STATE_OFFLINE)) {
+        if (f->header->state != (f->archive ? STATE_ARCHIVED : STATE_OFFLINE) ||
+            f->offline_error < 0 || (f->archive && f->deferred_archive)) {
                 r = journal_file_set_offline(f, /* wait= */ true);
                 if (r < 0)
                         log_debug_errno(r, "Failed to set journal file '%s' offline, ignoring: %m", f->path);

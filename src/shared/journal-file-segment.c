@@ -11,13 +11,14 @@
 #include "journal-authenticate.h"
 #include "journal-file-segment.h"
 #include "journal-file-util.h"
+#include "memory-util.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "user-util.h"
 #include "xattr-util.h"
 
 static bool journal_file_segment_name_valid(const char *name) {
-        _cleanup_free_ char *prefix = NULL;
+        char prefix[STRLEN("user-") + DECIMAL_STR_MAX(uid_t)];
         const char *at;
         sd_id128_t id;
         uid_t uid;
@@ -31,9 +32,11 @@ static bool journal_file_segment_name_valid(const char *name) {
         hex[32] = 0;
         if (sd_id128_from_string(hex, &id) < 0)
                 return false;
-        prefix = strndup(name, at - name);
-        if (!prefix)
+        size_t length = at - name;
+        if (length >= sizeof(prefix))
                 return false;
+        memcpy(prefix, name, length);
+        prefix[length] = 0;
         if (streq(prefix, "system"))
                 return true;
         return startswith(prefix, "user-") && parse_uid(prefix + STRLEN("user-"), &uid) >= 0;
@@ -47,6 +50,10 @@ int journal_file_segment_create(JournalFile *template, JournalFileFlags flags, J
 
         assert(template);
         assert(ret);
+
+        r = journal_file_segment_state_error(template->segment_state);
+        if (r < 0)
+                return r;
 
         /* Keep the existing path when sealing is requested, including when keys might appear between
          * rotations. Segment creation does not yet transfer or advance shared FSS state. */
@@ -63,7 +70,10 @@ int journal_file_segment_create(JournalFile *template, JournalFileFlags flags, J
         segment = new(JournalFileSegment, 1);
         if (!segment)
                 return -ENOMEM;
-        *segment = (JournalFileSegment) { .fd = -EBADF };
+        *segment = (JournalFileSegment) {
+                .fd = -EBADF,
+                .state = template->segment_state,
+        };
 
         r = sd_id128_randomize(&id);
         if (r < 0)
@@ -90,8 +100,8 @@ JournalFileSegment* journal_file_segment_free(JournalFileSegment *segment) {
 
         /* Only remove a name actually created by us, never an O_EXCL collision. Adoption transfers both
          * the descriptor and namespace responsibility to the JournalFile. */
-        if (segment->fd >= 0 && segment->path)
-                (void) unlink(segment->path);
+        if (segment->fd >= 0 && segment->path && unlink(segment->path) < 0 && errno != ENOENT)
+                journal_file_segment_state_fail(segment->state, -errno);
         safe_close(segment->fd);
         free(segment->path);
         return mfree(segment);
@@ -106,6 +116,12 @@ int journal_file_segment_adopt(JournalFileSegment *segment, JournalFile *templat
         assert(segment->path);
         assert(template);
         assert(ret);
+
+        /* A result may have become ready before another journal failed publication. Do not adopt it
+         * after the shared circuit breaker trips, even if its original owner/file ID still matches. */
+        r = journal_file_segment_state_error(template->segment_state);
+        if (r < 0)
+                return r;
 
         r = journal_file_open(segment->fd, segment->path, O_RDWR|O_CREAT, flags|JOURNAL_NEW_SEGMENT,
                               template->mode, template->compress_threshold_bytes, /* metrics= */ NULL,
@@ -137,8 +153,11 @@ int journal_file_rotate_segment(JournalFile **f, JournalFile *next, Set *deferre
          * file has no worker, so this usually returns immediately. Its predecessor is independently
          * managed by the caller's bounded deferred-close set. */
         r = journal_file_set_offline_thread_join(*f);
+        if (r >= 0)
+                r = journal_file_segment_state_error((*f)->segment_state);
         if (r < 0) {
-                (void) unlink(next->path);
+                if (unlink(next->path) < 0 && errno != ENOENT)
+                        journal_file_segment_state_fail(next->segment_state, -errno);
                 journal_file_close(next);
                 return r;
         }
@@ -153,6 +172,57 @@ int journal_file_rotate_segment(JournalFile **f, JournalFile *next, Set *deferre
         return 0;
 }
 
+static int journal_file_segment_empty(int fd, const struct stat *st) {
+        Header h;
+        ssize_t n;
+
+        if (st->st_size == 0)
+                return true;
+
+        /* Only recognize the current constructor's complete empty image. Bound recovery I/O; larger or
+         * unfamiliar images are preserved, not assumed empty. This is not a journal size limit. */
+        if (st->st_size < (int64_t) sizeof(Header) || (uint64_t) st->st_size > 8 * U64_MB)
+                return false;
+        n = pread(fd, &h, sizeof(h), 0);
+        if (n < 0)
+                return -errno;
+        if (n != sizeof(h) || sd_id128_is_null(h.file_id) ||
+            (le32toh(h.incompatible_flags) & ~HEADER_INCOMPATIBLE_ANY) != 0)
+                return false;
+
+        Header expected = {
+                .compatible_flags = htole32(HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID),
+                .incompatible_flags = h.incompatible_flags,
+                .state = STATE_ONLINE,
+                .file_id = h.file_id,
+                .machine_id = h.machine_id,
+                .seqnum_id = h.seqnum_id,
+                .header_size = htole64(ALIGN64(sizeof(Header))),
+                .arena_size = htole64(st->st_size - ALIGN64(sizeof(Header))),
+                .tail_entry_seqnum = h.tail_entry_seqnum,
+        };
+        memcpy(expected.signature, HEADER_SIGNATURE, sizeof(expected.signature));
+        if (memcmp(&h, &expected, sizeof(h)) != 0)
+                return false;
+
+        /* Counts and offsets can be damaged together. Never discard nonzero object data merely because
+         * the header claims it has no objects. Memory use and total scanned bytes are bounded. */
+        for (uint64_t offset = sizeof(Header); offset < (uint64_t) st->st_size;) {
+                uint8_t buffer[4096];
+
+                n = pread(fd, buffer, MIN(sizeof(buffer), (uint64_t) st->st_size - offset), offset);
+                if (n < 0) {
+                        if (errno == EINTR)
+                                continue;
+                        return -errno;
+                }
+                if (n == 0 || !memeqzero(buffer, n))
+                        return false;
+                offset += n;
+        }
+        return true;
+}
+
 int journal_file_recover_segments(const char *directory) {
         _cleanup_closedir_ DIR *d = NULL;
         bool changed = false;
@@ -164,8 +234,6 @@ int journal_file_recover_segments(const char *directory) {
         FOREACH_DIRENT(de, d, return -errno) {
                 _cleanup_close_ int fd = -EBADF;
                 struct stat st;
-                Header h;
-                ssize_t n;
 
                 if (!journal_file_segment_name_valid(de->d_name))
                         continue;
@@ -176,15 +244,13 @@ int journal_file_recover_segments(const char *directory) {
                         return -errno;
                 if (!S_ISREG(st.st_mode))
                         continue;
-                n = pread(fd, &h, sizeof(h), 0);
-                if (n < 0)
-                        return -errno;
+                r = journal_file_segment_empty(fd, &st);
+                if (r < 0)
+                        return r;
 
-                /* Only a never-adopted empty segment can be discarded. Preserve all other files, including
-                 * damaged headers, using the existing recoverable .journal~ convention. Do not choose only
-                 * a newest-file winner, append to a crashed segment, or rewrite its contents. */
-                if (n == 0 || (n == sizeof(h) && memcmp(h.signature, HEADER_SIGNATURE, 8) == 0 &&
-                               h.n_objects == 0 && h.n_entries == 0)) {
+                /* Preserve every ambiguous image, including damaged headers and interrupted creation,
+                 * using .journal~ without modifying its contents. Only a proven empty image is removed. */
+                if (r > 0) {
                         if (unlinkat(dirfd(d), de->d_name, 0) < 0)
                                 return -errno;
                 } else {

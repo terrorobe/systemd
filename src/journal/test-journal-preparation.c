@@ -183,6 +183,7 @@ TEST(prepare_not_ready_fallback) {
         JournalFile *prepared = NULL;
         uint64_t seqnum = 0;
         eventfd_t value;
+        JournalFileSegmentState state = {};
 
         ASSERT_OK(mkdtemp_malloc(/* pattern= */ NULL, &dir));
         ASSERT_NOT_NULL(path = path_join(dir, "system.journal"));
@@ -193,6 +194,7 @@ TEST(prepare_not_ready_fallback) {
         ASSERT_OK_ERRNO(release = eventfd(0, EFD_CLOEXEC));
         prepare_ready_fd = ready;
         prepare_release_fd = release;
+        f->segment_state = &state; /* The owner outlives both the replaced file and the gated preparer. */
         atomic_store(&block_next_fsync, true);
         ASSERT_OK(journal_file_preparation_start(f, /* flags= */ 0, &p));
         ASSERT_OK_ERRNO(eventfd_read(ready, &value));

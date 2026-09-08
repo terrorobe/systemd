@@ -316,6 +316,8 @@ static int manager_open_journal(
         if (r < 0)
                 return r;
 
+        f->segment_state = &m->segment_state;
+
         r = journal_file_enable_post_change_timer(f, m->event, POST_CHANGE_TIMER_INTERVAL_USEC);
         if (r < 0)
                 return r;
@@ -579,9 +581,31 @@ static bool manager_preparation_live(Manager *m, JournalFilePreparation *p) {
         return false;
 }
 
+static bool manager_segments_available(Manager *m) {
+        int r;
+
+        r = journal_file_segment_state_error(&m->segment_state);
+        if (r >= 0)
+                return true;
+
+        /* Reclaim finished preparations without waiting for unrelated in-flight I/O on the ingress path. */
+        FOREACH_ELEMENT(p, m->preparations)
+                if (*p && journal_file_preparation_done(*p))
+                        *p = journal_file_preparation_free(*p);
+
+        if (!m->segment_error_warned) {
+                log_warning_errno(r, "Journal segment cleanup or publication failed, using conventional rotation until restart: %m");
+                m->segment_error_warned = true;
+        }
+        return false;
+}
+
 static void manager_prepare_journal(Manager *m, JournalFile *f) {
         JournalFileFlags flags;
         int r;
+
+        if (!manager_segments_available(m))
+                return;
 
         flags = manager_get_file_flags(m, f != m->runtime_journal && m->config.seal);
         if (FLAGS_SET(flags, JOURNAL_SEAL) || JOURNAL_HEADER_SEALED(f->header))
@@ -624,7 +648,10 @@ static int manager_do_rotate(
 
         JournalFile *next = NULL;
         JournalFileFlags flags = manager_get_file_flags(m, seal);
+        bool segments_available = manager_segments_available(m);
         FOREACH_ELEMENT(p, m->preparations) {
+                if (!segments_available)
+                        break;
                 if (!journal_file_preparation_matches(*p, *f) || !journal_file_preparation_done(*p))
                         continue;
                 r = journal_file_preparation_take(*p, *f, flags, m->mmap, &next);
@@ -633,7 +660,7 @@ static int manager_do_rotate(
                 *p = journal_file_preparation_free(*p);
                 break;
         }
-        if (!next && !FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
+        if (!next && segments_available && !FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
                 _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
 
                 r = journal_file_segment_create(*f, flags, &segment);
