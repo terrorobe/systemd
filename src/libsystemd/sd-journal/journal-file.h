@@ -59,7 +59,7 @@ typedef struct JournalFileSegmentState {
 } JournalFileSegmentState;
 
 static inline int journal_file_segment_state_error(const JournalFileSegmentState *state) {
-        return state ? __atomic_load_n(&state->error, __ATOMIC_SEQ_CST) : 0;
+        return state ? __atomic_load_n(&state->error, __ATOMIC_RELAXED) : 0;
 }
 
 static inline void journal_file_segment_state_fail(JournalFileSegmentState *state, int error) {
@@ -68,7 +68,7 @@ static inline void journal_file_segment_state_fail(JournalFileSegmentState *stat
         assert(error < 0);
         if (state)
                 (void) __atomic_compare_exchange_n(&state->error, &expected, error, false,
-                                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
 typedef struct JournalFile {
