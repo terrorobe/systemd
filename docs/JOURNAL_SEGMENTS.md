@@ -26,10 +26,9 @@ Only the explicitly transferred new descriptor can bypass the ordinary rejection
 file. Adoption validates that it is still empty and unsealed, attaches it to the writer's existing mmap
 cache, and initializes hash tables through the ordinary constructors.
 
-The writer transfers the old file's final sequence boundary when adopting the replacement. It then
-switches its in-memory active-file pointer without changing either pathname. Creating the replacement
-synchronously is sufficient for this protocol; creating it ahead of time is a separate scheduling choice.
-If segment creation fails, conventional rotation remains available as a fallback.
+The writer transfers the old file's final sequence boundary when adopting the replacement, then switches
+its active-file pointer without changing either pathname. Segment creation occurs synchronously during
+rotation. If it fails, journald uses conventional rotation.
 
 ## Finalization
 
@@ -55,28 +54,23 @@ The latch survives sync drains, journal eviction, configuration reopen and stora
 finalizers may retry, but success does not clear the latch: previously closed files may still need startup
 recovery.
 
-This deliberately trades the rotation optimization for a bound under failure. Stranded unique names are
-limited to files already active or in flight when the failure occurs: the bounded active journal population,
-two deferred files and the current foreground handoff candidate. Lifecycle closes cannot
-reset that accounting by freeing descriptors, and no fresh unique names replenish it. Failed names
-remain recoverable; they are not deleted to satisfy the bound.
+After the error is latched, journald creates no new unique names. Files that were already active or in flight
+remain recoverable and continue to count toward normal storage limits.
 
-A synchronous client request drains deferred finalization before syncing active persistent journals. The
-existing manager-level acknowledgment behavior under I/O errors is unchanged and remains a separate known
-limitation; this protocol's checked finalizer does not fix that API. Active unique names were already made
-durable before adoption. A full deferred backlog still applies backpressure rather than spawning unbounded
+A synchronous request drains deferred finalization before syncing active persistent journals. Active unique
+names are durable before adoption. A full deferred backlog applies backpressure rather than spawning more
 workers. Orderly lifecycle close attempts to finalize a unique active segment as an archive.
 
 ## Recovery and compatibility
 
 Before opening new journals in a storage directory, recovery scans the exact unique segment patterns.
-It removes zero-length files and recognizable unused replacements only after checking the complete empty
-header and a zero-filled arena. The scan is bounded to 8 MiB per candidate; larger or unfamiliar images,
-partial headers and contradictory metadata are preserved through the existing `.journal~` convention,
-without rewriting their contents. Vacuum applies normal retention to these suspect files rather than
-unconditionally deleting them based on an empty entry counter. The scan preserves all potentially populated
-segments, not just a selected newest file, and synchronizes its directory changes. Journald then opens fresh
-conventional active files. Repeating recovery is safe.
+Zero-length candidates are removed. Other candidates are removed only if a complete empty header and
+zero-filled arena identify an unused replacement. The scan is bounded to 8 MiB per candidate; larger or
+unfamiliar images, partial headers and contradictory metadata are preserved through the existing
+`.journal~` convention without rewriting their contents. Vacuum applies normal retention to these suspect
+files rather than unconditionally deleting them based on an empty entry counter. The scan preserves all
+potentially populated segments, not just a selected newest file, and synchronizes its directory changes.
+Journald then opens fresh conventional active files. Repeating recovery is safe.
 
 Readers can continue using directory enumeration, the existing journal format and inotify notifications.
 Existing file descriptors and mappings survive the final archive rename. Reader compatibility alone
