@@ -358,14 +358,14 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
                            f->path);
 
         /* Initiate a new offline. */
-        __atomic_store_n(&f->offline_state, OFFLINE_SYNCING, __ATOMIC_SEQ_CST);
+        f->offline_state = OFFLINE_SYNCING;
 
         if (wait) {
                 /* Without using a thread if waiting. */
                 journal_file_set_offline_internal(f);
 
-                assert(__atomic_load_n(&f->offline_state, __ATOMIC_SEQ_CST) == OFFLINE_DONE);
-                __atomic_store_n(&f->offline_state, OFFLINE_JOINED, __ATOMIC_SEQ_CST);
+                assert(f->offline_state == OFFLINE_DONE);
+                f->offline_state = OFFLINE_JOINED;
 
         } else {
                 sigset_t ss, saved_ss;
@@ -378,7 +378,7 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
 
                 r = pthread_sigmask(SIG_BLOCK, &ss, &saved_ss);
                 if (r > 0) {
-                        __atomic_store_n(&f->offline_state, OFFLINE_JOINED, __ATOMIC_SEQ_CST);
+                        f->offline_state = OFFLINE_JOINED;
                         return -r;
                 }
 
@@ -386,7 +386,7 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
 
                 k = pthread_sigmask(SIG_SETMASK, &saved_ss, NULL);
                 if (r > 0) {
-                        __atomic_store_n(&f->offline_state, OFFLINE_JOINED, __ATOMIC_SEQ_CST);
+                        f->offline_state = OFFLINE_JOINED;
                         return -r;
                 }
                 if (k > 0)
