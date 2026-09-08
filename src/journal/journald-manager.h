@@ -95,6 +95,10 @@ typedef struct Manager {
 
         Set *deferred_closes;
 
+        /* Shared by all journals; remains latched across reopen, eviction and storage changes. */
+        JournalFileSegmentState segment_state;
+        bool segment_error_warned;
+
         uint64_t *kernel_seqnum;
         RateLimit kmsg_own_ratelimit;
 

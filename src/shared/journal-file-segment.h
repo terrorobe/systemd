@@ -6,6 +6,7 @@
 typedef struct JournalFileSegment {
         int fd;
         char *path;
+        JournalFileSegmentState *state;
 } JournalFileSegment;
 
 int journal_file_segment_create(JournalFile *template, JournalFileFlags flags, JournalFileSegment **ret);

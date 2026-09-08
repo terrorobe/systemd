@@ -138,6 +138,18 @@ executables += [
                 ],
         },
         journal_test_template + {
+                'sources' : files('test-journald-segment-errors.c'),
+                'dependencies' : [
+                        libacl_cflags,
+                        libaudit_cflags,
+                        liblz4_cflags,
+                        libpcre2_cflags,
+                        libselinux_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                ],
+        },
+        journal_test_template + {
                 'sources' : files('test-journald-deferred-close.c'),
                 'dependencies' : [
                         libacl_cflags,

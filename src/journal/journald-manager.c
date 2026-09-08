@@ -316,6 +316,8 @@ static int manager_open_journal(
         if (r < 0)
                 return r;
 
+        f->segment_state = &m->segment_state;
+
         r = journal_file_enable_post_change_timer(f, m->event, POST_CHANGE_TIMER_INTERVAL_USEC);
         if (r < 0)
                 return r;
@@ -562,6 +564,20 @@ static JournalFile* manager_find_journal(Manager *m, uid_t uid) {
         return m->system_journal;
 }
 
+static bool manager_segments_available(Manager *m) {
+        int r;
+
+        r = journal_file_segment_state_error(&m->segment_state);
+        if (r >= 0)
+                return true;
+
+        if (!m->segment_error_warned) {
+                log_warning_errno(r, "Journal segment cleanup or publication failed, using conventional rotation until restart: %m");
+                m->segment_error_warned = true;
+        }
+        return false;
+}
+
 static int manager_do_rotate(
                 Manager *m,
                 JournalFile **f,
@@ -583,7 +599,7 @@ static int manager_do_rotate(
 
         JournalFile *next = NULL;
         JournalFileFlags flags = manager_get_file_flags(m, seal);
-        if (!FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
+        if (manager_segments_available(m) && !FLAGS_SET(flags, JOURNAL_SEAL) && !JOURNAL_HEADER_SEALED((*f)->header)) {
                 _cleanup_(journal_file_segment_freep) JournalFileSegment *segment = NULL;
 
                 r = journal_file_segment_create(*f, flags, &segment);

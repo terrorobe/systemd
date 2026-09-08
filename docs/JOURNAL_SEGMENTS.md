@@ -41,18 +41,40 @@ its finalization, preserving the sequence:
 3. Rename the unique name to the conventional archive name without replacing an existing file, then
    synchronize the parent directory.
 
-Only after archive publication does the file become an ordinary vacuum candidate. A failed rename
-leaves its previous recoverable name intact. A synchronous client request drains outstanding deferred
-finalization before synchronizing active persistent journals. Active unique names were already made
-durable before adoption. A full deferred backlog still applies backpressure rather than spawning
-unbounded workers. Orderly lifecycle close finalizes a unique active segment as an archive.
+After the archive rename, the file is an ordinary vacuum candidate. Both file barriers must succeed before
+that rename; the finalizer reports a failure without publishing if either fails. A failed rename leaves the
+old recoverable name intact. A failed directory sync leaves an explicit pending obligation and the actual
+renamed path in memory, so retries synchronize that directory without renaming onto the file itself or
+repeating successful file barriers.
+
+A finalization error, or failure to unlink an unused replacement, latches an error shared by all of the
+manager's journals. Allocation of fresh unique names and adoption of replacement segments
+stop; rotation uses the conventional path until daemon restart. Conventional rotation may reuse the current
+active pathname, including a unique-format name, but archives its predecessor before creating the replacement.
+The latch survives sync drains, journal eviction, configuration reopen and storage changes. Existing finalizers may retry, but success does not clear the latch: previously
+closed files may still need startup recovery.
+
+This deliberately trades the rotation optimization for a bound under failure. Stranded unique names are
+limited to files already active or in flight when the failure occurs: the bounded active journal population,
+two deferred files and the current foreground handoff candidate. Lifecycle closes cannot
+reset that accounting by freeing descriptors, and no fresh unique names replenish it. Failed names
+remain recoverable; they are not deleted to satisfy the bound.
+
+A synchronous client request drains deferred finalization before syncing active persistent journals. The
+existing manager-level acknowledgment behavior under I/O errors is unchanged and remains a separate known
+limitation; this protocol's checked finalizer does not fix that API. Active unique names were already made
+durable before adoption. A full deferred backlog still applies backpressure rather than spawning unbounded
+workers. Orderly lifecycle close attempts to finalize a unique active segment as an archive.
 
 ## Recovery and compatibility
 
 Before opening new journals in a storage directory, recovery scans the exact unique segment patterns.
-It removes never-adopted empty files and moves other stranded segments to the existing `.journal~`
-convention without rewriting their contents. The scan preserves all potentially populated segments,
-not just a selected newest file, and synchronizes its directory changes. Journald then opens fresh
+It removes zero-length files and recognizable unused replacements only after checking the complete empty
+header and a zero-filled arena. The scan is bounded to 8 MiB per candidate; larger or unfamiliar images,
+partial headers and contradictory metadata are preserved through the existing `.journal~` convention,
+without rewriting their contents. Vacuum applies normal retention to these suspect files rather than
+unconditionally deleting them based on an empty entry counter. The scan preserves all potentially populated
+segments, not just a selected newest file, and synchronizes its directory changes. Journald then opens fresh
 conventional active files. Repeating recovery is safe.
 
 Readers can continue using directory enumeration, the existing journal format and inotify notifications.
