@@ -563,7 +563,7 @@ static int manager_do_rotate(
 
         log_debug("Rotating journal file %s.", (*f)->path);
 
-        manager_vacuum_deferred_closes(m);
+        manager_vacuum_deferred_closes(m, DEFERRED_CLOSES_ROTATION_MAX);
 
         r = journal_file_rotate(f, m->mmap, manager_get_file_flags(m, seal), m->config.compress.threshold_bytes, m->deferred_closes);
         if (r < 0) {
@@ -592,7 +592,7 @@ static void manager_process_deferred_closes(Manager *m) {
         }
 }
 
-static void manager_vacuum_deferred_closes_to(Manager *m, size_t max) {
+void manager_vacuum_deferred_closes(Manager *m, size_t max) {
         assert(m);
         assert(max > 0);
 
@@ -610,10 +610,6 @@ static void manager_vacuum_deferred_closes_to(Manager *m, size_t max) {
                 assert_se(f = set_steal_first(m->deferred_closes));
                 journal_file_deferred_close(f);
         }
-}
-
-void manager_vacuum_deferred_closes(Manager *m) {
-        manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_ROTATION_MAX);
 }
 
 static int manager_archive_offline_user_journals(Manager *m) {
@@ -672,7 +668,7 @@ static int manager_archive_offline_user_journals(Manager *m) {
                         continue;
                 }
 
-                manager_vacuum_deferred_closes_to(m, DEFERRED_CLOSES_OFFLINE_USERS_MAX);
+                manager_vacuum_deferred_closes(m, DEFERRED_CLOSES_OFFLINE_USERS_MAX);
 
                 /* Open the file briefly, so that we can archive it */
                 r = journal_file_open(
