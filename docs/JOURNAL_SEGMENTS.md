@@ -37,7 +37,7 @@ Journald can start segment creation after an entry has been appended, while the 
 receiving entries. At most two preparations are retained globally across journal streams. Each worker
 receives copied identity, pathname and policy inputs and performs only the descriptor-based creation
 step. It does not access the active file, mmap cache, event sources or shared FSS state. It shares only an
-owner-scoped atomic failure latch with other files and preparations; that owner outlives all of their workers.
+owner-scoped atomic failure latch with other files and preparations. That owner outlives all workers.
 
 A completed preparation is adopted at rotation only if it still belongs to the current file and policy.
 Adoption uses the final sequence boundary, not the earlier snapshot. If no usable segment is ready,
@@ -68,10 +68,11 @@ repeating successful file barriers.
 A finalization error, or failure to unlink an unused preparation, latches an error shared by all of the
 manager's journals and preparations. Allocation of fresh unique names and adoption of prepared segments
 stop; rotation uses the conventional path until daemon restart. Conventional rotation may reuse the current
-active pathname, including a unique-format name, but archives its predecessor before creating the replacement.
-The latch survives sync drains, journal eviction, configuration reopen and storage changes. Existing finalizers may retry, but success does not clear the latch: previously
-closed files may still need startup recovery. Completed unused preparations are discarded without waiting
-for unfinished preparers on the ingress path.
+active pathname, including a unique-format name. It archives its predecessor before creating the replacement.
+The latch survives sync drains, journal eviction, configuration reopen and storage changes. Existing
+finalizers may retry, but success does not clear the latch: previously closed files may still need startup
+recovery. Completed unused preparations are discarded without waiting for unfinished preparers on the ingress
+path.
 
 This deliberately trades the rotation optimization for a bound under failure. Stranded unique names are
 limited to files already active or in flight when the failure occurs: the bounded active journal population,
