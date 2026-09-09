@@ -98,62 +98,82 @@ stranding these protected names when reverting to an older writer.
 
 ## Example lifecycle
 
-The labels below show the journal header state followed by the writer's role for the file. A system journal
-initially has one active file:
+The columns below show the journal header state and the writer's role for each file. A system journal starts
+with one active file:
 
 ```text
-system.journal                                      ONLINE    active
+system.journal                                                                      ONLINE    active
 ```
 
 After the first successful append, journald starts creating and synchronizing an empty replacement if a
 preparation slot is available:
 
 ```text
-system.journal                                      ONLINE    active
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    empty replacement
+system.journal                                                                      ONLINE    active
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    prepared
 ```
 
-If no completed matching replacement is available at rotation, journald creates one synchronously instead
-of waiting for an unfinished preparation.
-
-Handoff changes the roles but not the names or header states:
+At rotation, a completed matching replacement becomes active. Handoff changes roles but not names or header
+states:
 
 ```text
-system.journal                                      ONLINE    finalizing
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
+system.journal                                                                      ONLINE    finalizing
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    active
 ```
 
-The first finalization barrier synchronizes the old file's data. Its header remains `ONLINE`. Journald then
-writes `STATE_ARCHIVED` and synchronizes the file again:
+If no completed matching replacement is available, rotation creates one synchronously instead of waiting for
+an unfinished preparation.
+
+After the first successful append to the new active file, preparation of its successor may overlap
+finalization of the old file:
 
 ```text
-system.journal                                      ARCHIVED  awaiting publication
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
+system.journal                                                                      ONLINE    finalizing
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    active
+system@4b3ef6704cff4c61af21ebfbd74a8c63.journal                                     ONLINE    prepared
 ```
 
-Publication renames the old file to its conventional archive name and synchronizes the directory:
+The first finalization barrier synchronizes the old file's data without changing its header state. Journald
+then writes `STATE_ARCHIVED` and synchronizes the file again:
 
 ```text
-system@7b36f68b69434866a7e889acef36a43e-0000000000000001-00064f2ab4c00000.journal  ARCHIVED  archive
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
+system.journal                                                                      ARCHIVED  pending
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    active
+system@4b3ef6704cff4c61af21ebfbd74a8c63.journal                                     ONLINE    prepared
 ```
 
-The next rotation creates another replacement:
+Publication gives the old file its conventional archive name and synchronizes the directory:
 
 ```text
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
-system@4b3ef6704cff4c61af21ebfbd74a8c63.journal    ONLINE    empty replacement
+system@7b36f68b69434866a7e889acef36a43e-0000000000000001-00064f2ab4c00000.journal   ARCHIVED  archive
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    active
+system@4b3ef6704cff4c61af21ebfbd74a8c63.journal                                     ONLINE    prepared
 ```
 
-After handoff and finalization, the first random name is replaced by a conventional archive name. Random
-identifiers are not retained in archive names.
+At the next rotation, the prepared successor becomes active:
 
-On startup, a proven unused empty replacement is deleted. Other unique candidates are preserved without
+```text
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    finalizing
+system@4b3ef6704cff4c61af21ebfbd74a8c63.journal                                     ONLINE    active
+```
+
+The first successful append to that active file starts preparation of the following segment:
+
+```text
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    finalizing
+system@4b3ef6704cff4c61af21ebfbd74a8c63.journal                                     ONLINE    active
+system@81c58abc46d847e5a8cf478fa757cb62.journal                                     ONLINE    prepared
+```
+
+Finalization replaces each old random name with a conventional archive name. Random identifiers are not
+retained in archive names.
+
+On startup, a proven unused empty preparation is deleted. Other unique candidates are preserved without
 changing their header state. For example, an `ONLINE` file interrupted while active may become:
 
 ```text
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2@00064f2abc000000-74f8e48a7ae47d31.journal~  ONLINE  recovered
-system.journal                                      ONLINE    new active
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2@00064f2abc000000-74f8e48a7ae47d31.journal~  ONLINE    recovered
+system.journal                                                                      ONLINE    new active
 ```
 
 A file interrupted after the second finalization barrier may instead be recovered with an `ARCHIVED` header.
