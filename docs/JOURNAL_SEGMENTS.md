@@ -87,7 +87,7 @@ with one active file:
 system.journal                                                                      ONLINE    active
 ```
 
-Synchronous rotation creates and synchronizes an empty replacement before handoff:
+Before handoff, journald creates and synchronizes an empty replacement:
 
 ```text
 system.journal                                                                      ONLINE    active
@@ -116,7 +116,7 @@ system@7b36f68b69434866a7e889acef36a43e-0000000000000001-00064f2ab4c00000.journa
 system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    active
 ```
 
-The next synchronous rotation creates another replacement:
+Before the next handoff, journald creates another replacement:
 
 ```text
 system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal                                     ONLINE    active
