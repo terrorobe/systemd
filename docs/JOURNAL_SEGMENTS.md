@@ -98,40 +98,63 @@ stranding these protected names when reverting to an older writer.
 
 ## Example lifecycle
 
-A system journal initially uses the conventional active name:
+The labels below show the journal header state followed by the writer's role for the file. A system journal
+initially has one active file:
 
 ```text
-system.journal
+system.journal                                      ONLINE    active
 ```
 
-After the first successful append, journald starts creating and synchronizing a uniquely named empty
-replacement if a preparation slot is available:
+After the first successful append, journald starts creating and synchronizing an empty replacement if a
+preparation slot is available:
 
 ```text
-system.journal
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal
+system.journal                                      ONLINE    active
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    empty replacement
 ```
 
 If no completed matching replacement is available at rotation, journald creates one synchronously instead
 of waiting for an unfinished preparation.
 
-After handoff, the names are unchanged: `system.journal` is immutable and finalizing, while the uniquely
-named file is active. Once finalization completes, the old file is published under its conventional archive
-name:
+Handoff changes the roles but not the names or header states:
 
 ```text
-system@7b36f68b69434866a7e889acef36a43e-0000000000000001-00064f2ab4c00000.journal
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal
+system.journal                                      ONLINE    finalizing
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
 ```
 
-The next rotation creates another unique replacement. The old unique name is replaced by a conventional
-archive name after its finalization; the random identifier is not retained in the archive name.
-
-If recovery cannot prove that a unique candidate is an unused empty replacement, it preserves the file using
-the existing unclean-file naming convention. For example:
+The first finalization barrier synchronizes the old file's data. Its header remains `ONLINE`. Journald then
+writes `STATE_ARCHIVED` and synchronizes the file again:
 
 ```text
-system@9f1f3eafec2f46e8b79aaac0bb58c6d2@00064f2abc000000-74f8e48a7ae47d31.journal~
+system.journal                                      ARCHIVED  awaiting publication
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
 ```
 
+Publication renames the old file to its conventional archive name and synchronizes the directory:
+
+```text
+system@7b36f68b69434866a7e889acef36a43e-0000000000000001-00064f2ab4c00000.journal  ARCHIVED  archive
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
+```
+
+The next rotation creates another replacement:
+
+```text
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal    ONLINE    active
+system@4b3ef6704cff4c61af21ebfbd74a8c63.journal    ONLINE    empty replacement
+```
+
+After handoff and finalization, the first random name is replaced by a conventional archive name. Random
+identifiers are not retained in archive names.
+
+On startup, a proven unused empty replacement is deleted. Other unique candidates are preserved without
+changing their header state. For example, an `ONLINE` file interrupted while active may become:
+
+```text
+system@9f1f3eafec2f46e8b79aaac0bb58c6d2@00064f2abc000000-74f8e48a7ae47d31.journal~  ONLINE  recovered
+system.journal                                      ONLINE    new active
+```
+
+A file interrupted after the second finalization barrier may instead be recovered with an `ARCHIVED` header.
 User journals follow the same lifecycle with a `user-<uid>` prefix.
