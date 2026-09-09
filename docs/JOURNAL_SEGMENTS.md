@@ -104,12 +104,16 @@ A system journal initially uses the conventional active name:
 system.journal
 ```
 
-During rotation, journald creates and synchronizes a uniquely named empty replacement:
+After the first successful append, journald starts creating and synchronizing a uniquely named empty
+replacement if a preparation slot is available:
 
 ```text
 system.journal
 system@9f1f3eafec2f46e8b79aaac0bb58c6d2.journal
 ```
+
+If no completed matching replacement is available at rotation, journald creates one synchronously instead
+of waiting for an unfinished preparation.
 
 After handoff, the names are unchanged: `system.journal` is immutable and finalizing, while the uniquely
 named file is active. Once finalization completes, the old file is published under its conventional archive
